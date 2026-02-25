@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mülakat Randevu Sistemi</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=Playfair+Display:wght@700&display=swap" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+
+  <!-- Firebase -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+    import {
+      getFirestore, doc, getDoc, setDoc, updateDoc, deleteField,
+      collection, getDocs, onSnapshot
+    } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+    const firebaseConfig = {
+      apiKey:            "AIzaSyCLdA14t9BjDgbnh_C-JOoovtS1V5Cqj6w",
+      authDomain:        "mulakat-rezervasyon.firebaseapp.com",
+      projectId:         "mulakat-rezervasyon",
+      storageBucket:     "mulakat-rezervasyon.firebasestorage.app",
+      messagingSenderId: "1046752791579",
+      appId:             "1:1046752791579:web:84f667b36932a0511a3cbe"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db  = getFirestore(app);
+
+    // DB helper — tüm uygulamaya window üzerinden erişim
+    window._db = db;
+    window._firebase = {
+      doc, getDoc, setDoc, updateDoc, deleteField,
+      collection, getDocs, onSnapshot
+    };
+    window._dbReady = true;
+    window.dispatchEvent(new Event("firebase-ready"));
+  </script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: linear-gradient(135deg,#0f172a 0%,#1e3a5f 50%,#0f172a 100%); min-height: 100vh; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes fadeIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+    input:focus { outline: 2px solid #3b82f6; border-color: #3b82f6 !important; }
+    button:hover { filter: brightness(0.93); }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #f1f5f9; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback } = React;
+
+    // ── CONFIG ────────────────────────────────────────────────────────────────
+    const ADMIN_PASS = "mulakat2025";
+    const SLOTS_8    = ["10:00","10:30","11:00","11:30","13:30","14:00","14:30","15:00"];
+    const SLOTS_4_AM = ["10:00","10:30","11:00","11:30"];
+    const SLOTS_4_PM = ["13:30","14:00","14:30","15:00"];
+
+    const MONTH_NAMES = ["","Ocak","Şubat","Mart","Nisan","Mayıs","Haziran","Temmuz","Ağustos","Eylül","Ekim","Kasım","Aralık"];
+    const DAY_NAMES   = ["Pazar","Pazartesi","Salı","Çarşamba","Perşembe","Cuma","Cumartesi"];
+
+    // ── HELPERS ───────────────────────────────────────────────────────────────
+    function buildDays(year, month) {
+      const days = [], total = new Date(year, month, 0).getDate();
+      for (let d = 1; d <= total; d++) {
+        const dow = new Date(year, month-1, d).getDay();
+        if (dow !== 0 && dow !== 6) days.push(d);
+      }
+      return days;
+    }
+
+    function fmt(y, m, d) {
+      return `${y}-${String(m).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+    }
+
+    function displayDate(dateStr) {
+      const [y,m,d] = dateStr.split("-").map(Number);
+      const dow = new Date(y, m-1, d).getDay();
+      return `${DAY_NAMES[dow]}, ${d} ${MONTH_NAMES[m]} ${y}`;
+    }
+
+    function getSlotsForDay(dateStr, config) {
+      const t = config[dateStr]?.type;
+      if (!t || t==="8")     return SLOTS_8;
+      if (t==="4am")         return SLOTS_4_AM;
+      if (t==="4pm")         return SLOTS_4_PM;
+      if (t==="closed")      return [];
+      return SLOTS_8;
+    }
+
+    function waText(fullName, dateStr, slot) {
+      return `Sayın ${fullName}, mülakat randevunuz ${displayDate(dateStr)} tarihinde saat ${slot} olarak kaydedilmiştir. Randevunuzu onaylayınız.`;
+    }
+
+    // ── FIREBASE DB ───────────────────────────────────────────────────────────
+    // reservations/{dateStr} = { slots: { "10:00": {ad,soyad,tel,bookedAt}, ... } }
+    // config/{dateStr}       = { type: "8"|"4am"|"4pm"|"closed" }
+
+    async function waitForFirebase() {
+      if (window._dbReady) return;
+      await new Promise(res => window.addEventListener("firebase-ready", res, {once:true}));
+    }
+
+    async function fbGetReservations() {
+      await waitForFirebase();
+      const { collection, getDocs } = window._firebase;
+      const snap = await getDocs(collection(window._db, "reservations"));
+      const result = {};
+      snap.forEach(doc => {
+        const data = doc.data();
+        result[doc.id] = Object.entries(data.slots || {}).map(([slot, info]) => ({slot, ...info}));
+      });
+      return result;
+    }
+
+    async function fbGetConfig() {
+      await waitForFirebase();
+      const { collection, getDocs } = window._firebase;
+      const snap = await getDocs(collection(window._db, "config"));
+      const result = {};
+      snap.forEach(doc => { result[doc.id] = doc.data(); });
+      return result;
+    }
+
+    async function fbAddReservation(dateStr, slotData) {
+      await waitForFirebase();
+      const { doc, getDoc, setDoc, updateDoc } = window._firebase;
+      const ref  = doc(window._db, "reservations", dateStr);
+      const snap = await getDoc(ref);
+      const slots = snap.exists() ? (snap.data().slots || {}) : {};
+      if (slots[slotData.slot]) throw new Error("DOLU");
+      slots[slotData.slot] = { ad:slotData.ad, soyad:slotData.soyad, tel:slotData.tel, bookedAt: new Date().toISOString() };
+      await setDoc(ref, { slots });
+    }
+
+    async function fbCancelReservation(dateStr, slot) {
+      await waitForFirebase();
+      const { doc, getDoc, setDoc } = window._firebase;
+      const ref  = doc(window._db, "reservations", dateStr);
+      const snap = await getDoc(ref);
+      if (!snap.exists()) return;
+      const slots = snap.data().slots || {};
+      delete slots[slot];
+      await setDoc(ref, { slots });
+    }
+
+    async function fbSetDayConfig(dateStr, type) {
+      await waitForFirebase();
+      const { doc, setDoc } = window._firebase;
+      await setDoc(doc(window._db, "config", dateStr), { type });
+    }
+
+    function fbSubscribe(onRes, onCfg) {
+      if (!window._dbReady) {
+        window.addEventListener("firebase-ready", () => fbSubscribe(onRes, onCfg), {once:true});
+        return () => {};
+      }
+      const { collection, onSnapshot } = window._firebase;
+      const unsubRes = onSnapshot(collection(window._db, "reservations"), snap => {
+        const result = {};
+        snap.forEach(d => {
+          result[d.id] = Object.entries(d.data().slots || {}).map(([slot, info]) => ({slot, ...info}));
+        });
+        onRes(result);
+      });
+      const unsubCfg = onSnapshot(collection(window._db, "config"), snap => {
+        const result = {};
+        snap.forEach(d => { result[d.id] = d.data(); });
+        onCfg(result);
+      });
+      return () => { unsubRes(); unsubCfg(); };
+    }
+
+    // ── STYLES ────────────────────────────────────────────────────────────────
+    const S = {
+      page:      { minHeight:"100vh", display:"flex", alignItems:"flex-start", justifyContent:"center", padding:"32px 16px 64px" },
+      card:      { background:"#fff", borderRadius:20, padding:"32px 28px", maxWidth:580, width:"100%", boxShadow:"0 25px 50px rgba(0,0,0,0.35)", marginTop:24, animation:"fadeIn 0.3s ease" },
+      homeCard:  { background:"rgba(255,255,255,0.05)", backdropFilter:"blur(20px)", border:"1px solid rgba(255,255,255,0.1)", borderRadius:24, padding:"56px 40px", maxWidth:440, width:"100%", textAlign:"center", marginTop:64, animation:"fadeIn 0.4s ease" },
+      badge:     { display:"inline-block", background:"rgba(59,130,246,0.15)", color:"#93c5fd", border:"1px solid rgba(59,130,246,0.3)", borderRadius:100, padding:"4px 16px", fontSize:11, fontWeight:700, letterSpacing:2, marginBottom:24, textTransform:"uppercase" },
+      heroTitle: { fontFamily:"'Playfair Display',serif", fontSize:42, color:"#f1f5f9", lineHeight:1.2, marginBottom:16 },
+      heroSub:   { color:"#94a3b8", fontSize:15, lineHeight:1.7, marginBottom:36 },
+      title:     { fontFamily:"'Playfair Display',serif", fontSize:26, color:"#1e293b", marginBottom:4 },
+      sub:       { color:"#64748b", fontSize:14, marginBottom:20, fontFamily:"'DM Sans',sans-serif" },
+      backBtn:   { background:"none", border:"none", color:"#64748b", cursor:"pointer", fontSize:13, fontWeight:600, padding:0, marginBottom:16, display:"block", fontFamily:"'DM Sans',sans-serif" },
+      input:     { width:"100%", padding:"12px 16px", border:"2px solid #e2e8f0", borderRadius:12, fontSize:14, color:"#1e293b", fontFamily:"'DM Sans',sans-serif", marginBottom:12, display:"block" },
+      btnBlue:   { width:"100%", padding:"14px 24px", background:"linear-gradient(135deg,#1e40af,#3b82f6)", color:"#fff", border:"none", borderRadius:12, fontSize:15, fontWeight:700, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", marginTop:8, display:"block" },
+      btnGhost:  { width:"100%", padding:"12px 24px", background:"transparent", color:"#475569", border:"2px solid #e2e8f0", borderRadius:12, fontSize:14, fontWeight:600, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", marginTop:8, display:"block" },
+      btnGreen:  { padding:"10px 20px", background:"#16a34a", color:"#fff", border:"none", borderRadius:10, fontSize:13, fontWeight:700, cursor:"pointer", fontFamily:"'DM Sans',sans-serif" },
+      btnRed:    { padding:"6px 12px", borderRadius:8, border:"none", background:"#fee2e2", color:"#dc2626", cursor:"pointer", fontSize:12, fontWeight:600, fontFamily:"'DM Sans',sans-serif" },
+      errMsg:    { color:"#ef4444", fontSize:13, marginBottom:8, fontFamily:"'DM Sans',sans-serif" },
+      steps:     { display:"flex", marginBottom:28, alignItems:"center", justifyContent:"center" },
+      stepItem:  { display:"flex", flexDirection:"column", alignItems:"center", gap:4, flex:1 },
+      stepDot:   { width:28, height:28, borderRadius:"50%", display:"flex", alignItems:"center", justifyContent:"center", fontSize:12, fontWeight:700 },
+      calGrid:   { display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(80px,1fr))", gap:8 },
+      dayBtn:    { padding:"12px 6px", borderRadius:12, border:"2px solid #e2e8f0", background:"#f8fafc", display:"flex", flexDirection:"column", alignItems:"center", gap:4, fontFamily:"'DM Sans',sans-serif", width:"100%" },
+      slotGrid:  { display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:8 },
+      slotBtn:   { padding:"12px 8px", borderRadius:10, border:"2px solid #e2e8f0", fontSize:14, fontWeight:700, fontFamily:"'DM Sans',sans-serif", textAlign:"center" },
+      confirmBox:{ background:"#f8fafc", borderRadius:12, padding:"16px 20px", marginBottom:16, lineHeight:1.8, fontFamily:"'DM Sans',sans-serif", fontSize:14, color:"#374151" },
+      waBox:     { background:"#f0fdf4", border:"1px solid #bbf7d0", borderRadius:12, padding:"16px 20px", marginBottom:8 },
+      tabs:      { display:"flex", gap:6, marginBottom:16, flexWrap:"wrap", alignItems:"center" },
+      tabBtn:    { padding:"8px 16px", borderRadius:8, border:"none", cursor:"pointer", fontSize:13, fontWeight:600, fontFamily:"'DM Sans',sans-serif" },
+      adminGrid: { display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))", gap:12, maxHeight:480, overflowY:"auto", padding:4 },
+      adminDay:  { background:"#f8fafc", borderRadius:12, padding:"12px 14px", border:"1px solid #e2e8f0" },
+      table:     { width:"100%", borderCollapse:"collapse", fontSize:13, fontFamily:"'DM Sans',sans-serif" },
+      th:        { background:"#1e40af", color:"#fff", padding:"10px 12px", textAlign:"left", fontWeight:700 },
+      td:        { padding:"9px 12px", borderBottom:"1px solid #e2e8f0", color:"#374151" },
+      modal:     { position:"fixed", inset:0, background:"rgba(0,0,0,0.55)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:100, padding:16 },
+      modalBox:  { background:"#fff", borderRadius:20, padding:"28px 24px", maxWidth:400, width:"100%", boxShadow:"0 25px 50px rgba(0,0,0,0.3)", animation:"fadeIn 0.2s ease" },
+      monthSel:  { display:"flex", alignItems:"center", justifyContent:"center", gap:20, marginBottom:16 },
+      navBtn:    { width:32, height:32, borderRadius:8, border:"2px solid #e2e8f0", background:"#f8fafc", cursor:"pointer", fontSize:20, display:"flex", alignItems:"center", justifyContent:"center" },
+      spinner:   { width:36, height:36, borderRadius:"50%", border:"3px solid #e2e8f0", borderTop:"3px solid #3b82f6", animation:"spin 0.7s linear infinite", margin:"0 auto" },
+    };
+
+    // ── APP ───────────────────────────────────────────────────────────────────
+    function App() {
+      const [view, setView]               = useState("home");
+      const [reservations, setReservations] = useState({});
+      const [config, setConfig]           = useState({});
+      const [year, setYear]               = useState(2026);
+      const [month, setMonth]             = useState(3);
+      const [fbReady, setFbReady]         = useState(false);
+
+      useEffect(() => {
+        const unsub = fbSubscribe(
+          res => { setReservations(res); setFbReady(true); },
+          cfg => setConfig(cfg)
+        );
+        return unsub;
+      }, []);
+
+      if (!fbReady) return (
+        <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:16}}>
+          <div style={S.spinner} />
+          <p style={{color:"#94a3b8",fontFamily:"'DM Sans',sans-serif",fontSize:14}}>Bağlanıyor…</p>
+        </div>
+      );
+
+      const props = { reservations, config, year, month, setYear, setMonth, setView };
+
+      return (
+        <>
+          {view==="home"       && <HomeView setView={setView} />}
+          {view==="adminLogin" && <AdminLogin setView={setView} />}
+          {view==="book"       && <BookView {...props} />}
+          {view==="admin"      && <AdminView {...props} />}
+        </>
+      );
+    }
+
+    // ── HOME ──────────────────────────────────────────────────────────────────
+    function HomeView({ setView }) {
+      return (
+        <div style={S.page}>
+          <div style={S.homeCard}>
+            <div style={S.badge}>Mülakat 2026</div>
+            <h1 style={S.heroTitle}>Mülakat<br/>Randevu Sistemi</h1>
+            <p style={S.heroSub}>Uygun gün ve saatinizi seçerek randevunuzu kolayca oluşturun.</p>
+            <div style={{display:"flex",gap:12,flexDirection:"column",maxWidth:320,margin:"0 auto"}}>
+              <button style={S.btnBlue}  onClick={() => setView("book")}>🗓 Randevu Al</button>
+              <button style={S.btnGhost} onClick={() => setView("adminLogin")}>🔐 Yönetici Girişi</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── ADMIN LOGIN ───────────────────────────────────────────────────────────
+    function AdminLogin({ setView }) {
+      const [pass, setPass] = useState("");
+      const [err, setErr]   = useState(false);
+      const tryLogin = () => {
+        if (pass === ADMIN_PASS) setView("admin");
+        else { setErr(true); setTimeout(() => setErr(false), 2000); }
+      };
+      return (
+        <div style={S.page}>
+          <div style={{...S.card, maxWidth:380}}>
+            <button style={S.backBtn} onClick={() => setView("home")}>← Geri</button>
+            <h2 style={S.title}>Yönetici Girişi</h2>
+            <input type="password" placeholder="Şifre" value={pass}
+              onChange={e => setPass(e.target.value)}
+              onKeyDown={e => e.key==="Enter" && tryLogin()}
+              style={{...S.input, marginTop:16, borderColor:err?"#ef4444":"#e2e8f0"}} />
+            {err && <p style={S.errMsg}>Hatalı şifre</p>}
+            <button style={S.btnBlue} onClick={tryLogin}>Giriş Yap</button>
+          </div>
+        </div>
+      );
+    }
+
+    // ── BOOK VIEW ─────────────────────────────────────────────────────────────
+    function BookView({ year, month, reservations, config, setView }) {
+      const [step, setStep]     = useState(1);
+      const [selDate, setSelDate] = useState(null);
+      const [selSlot, setSelSlot] = useState(null);
+      const [form, setForm]     = useState({ ad:"", soyad:"", tel:"" });
+      const [saving, setSaving] = useState(false);
+      const [error, setError]   = useState("");
+      const [copyMsg, setCopyMsg] = useState("");
+      const days = buildDays(year, month);
+
+      const handleBook = async () => {
+        setSaving(true); setError("");
+        try {
+          await fbAddReservation(selDate, { slot:selSlot, ...form });
+          setStep(4);
+        } catch(e) {
+          setError(e.message==="DOLU" ? "Bu saat az önce doldu, lütfen başka bir saat seçin." : "Bir hata oluştu, tekrar deneyin.");
+        }
+        setSaving(false);
+      };
+
+      const copy = txt => {
+        navigator.clipboard.writeText(txt).then(() => { setCopyMsg("Kopyalandı!"); setTimeout(()=>setCopyMsg(""),2000); });
+      };
+
+      return (
+        <div style={S.page}>
+          <div style={S.card}>
+            <button style={S.backBtn} onClick={() => step>1 ? setStep(step-1) : setView("home")}>← Geri</button>
+
+            {/* Steps */}
+            <div style={S.steps}>
+              {["Gün","Saat","Bilgi","Onay"].map((s,i) => (
+                <div key={i} style={{...S.stepItem, opacity:i+1<=step?1:0.3}}>
+                  <div style={{...S.stepDot, background:i+1<=step?"#1e40af":"#e2e8f0", color:i+1<=step?"#fff":"#94a3b8"}}>{i+1}</div>
+                  <span style={{fontSize:11, color:i+1<=step?"#1e40af":"#94a3b8", fontWeight:600, fontFamily:"'DM Sans',sans-serif"}}>{s}</span>
+                </div>
+              ))}
+            </div>
+
+            {/* Step 1 — Gün */}
+            {step===1 && <>
+              <h2 style={S.title}>Gün Seçin</h2>
+              <p style={S.sub}>{MONTH_NAMES[month]} {year}</p>
+              <div style={S.calGrid}>
+                {days.map(d => {
+                  const dateStr   = fmt(year, month, d);
+                  const slots     = getSlotsForDay(dateStr, config);
+                  const booked    = (reservations[dateStr]||[]).length;
+                  const available = slots.length - booked;
+                  const closed    = slots.length===0;
+                  return (
+                    <button key={d} disabled={closed||available===0}
+                      onClick={() => { setSelDate(dateStr); setStep(2); }}
+                      style={{...S.dayBtn, opacity:(closed||available===0)?0.35:1, cursor:(closed||available===0)?"not-allowed":"pointer"}}>
+                      <span style={{fontSize:20,fontWeight:700}}>{d}</span>
+                      <span style={{fontSize:10,fontWeight:600,
+                        color:closed?"#94a3b8":available===0?"#ef4444":available<=2?"#f59e0b":"#22c55e"}}>
+                        {closed?"Kapalı":available===0?"Dolu":`${available} boş`}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </>}
+
+            {/* Step 2 — Saat */}
+            {step===2 && selDate && <>
+              <h2 style={S.title}>Saat Seçin</h2>
+              <p style={S.sub}>{displayDate(selDate)}</p>
+              <div style={S.slotGrid}>
+                {getSlotsForDay(selDate, config).map(slot => {
+                  const booked = (reservations[selDate]||[]).some(r=>r.slot===slot);
+                  return (
+                    <button key={slot} disabled={booked}
+                      onClick={() => { setSelSlot(slot); setStep(3); }}
+                      style={{...S.slotBtn, opacity:booked?0.35:1,
+                        background:selSlot===slot?"#1e40af":"#f8fafc",
+                        color:selSlot===slot?"#fff":"#1e293b",
+                        cursor:booked?"not-allowed":"pointer"}}>
+                      {slot}
+                      {booked && <div style={{fontSize:10,color:"#ef4444"}}>Dolu</div>}
+                    </button>
+                  );
+                })}
+              </div>
+            </>}
+
+            {/* Step 3 — Bilgi */}
+            {step===3 && <>
+              <h2 style={S.title}>Bilgileriniz</h2>
+              <p style={S.sub}>{displayDate(selDate)} — {selSlot}</p>
+              <input placeholder="Ad"    value={form.ad}    onChange={e=>setForm({...form,ad:e.target.value})}    style={{...S.input,marginTop:16}} />
+              <input placeholder="Soyad" value={form.soyad} onChange={e=>setForm({...form,soyad:e.target.value})} style={S.input} />
+              <input placeholder="Telefon (05xx...)" value={form.tel} onChange={e=>setForm({...form,tel:e.target.value})} style={S.input} />
+              {error && <p style={S.errMsg}>⚠️ {error}</p>}
+              <button style={{...S.btnBlue, opacity:(!form.ad||!form.soyad||!form.tel||saving)?0.5:1}}
+                disabled={!form.ad||!form.soyad||!form.tel||saving} onClick={handleBook}>
+                {saving ? <span>⏳ Kaydediliyor…</span> : "Randevuyu Onayla →"}
+              </button>
+            </>}
+
+            {/* Step 4 — Onay */}
+            {step===4 && (
+              <div style={{textAlign:"center"}}>
+                <div style={{fontSize:64,marginBottom:8}}>✅</div>
+                <h2 style={{...S.title,color:"#16a34a",textAlign:"center"}}>Randevunuz Alındı!</h2>
+                <div style={S.confirmBox}>
+                  <p><b>{form.ad} {form.soyad}</b></p>
+                  <p>{displayDate(selDate)}</p>
+                  <p>Saat: <b>{selSlot}</b></p>
+                  <p>Tel: {form.tel}</p>
+                </div>
+                <div style={S.waBox}>
+                  <p style={{fontWeight:600,marginBottom:8,color:"#1e293b",fontFamily:"'DM Sans',sans-serif"}}>📋 WhatsApp Mesajı</p>
+                  <p style={{fontSize:13,color:"#475569",marginBottom:12,lineHeight:1.6,fontFamily:"'DM Sans',sans-serif"}}>
+                    {waText(`${form.ad} ${form.soyad}`, selDate, selSlot)}
+                  </p>
+                  <button style={S.btnGreen} onClick={() => copy(waText(`${form.ad} ${form.soyad}`, selDate, selSlot))}>
+                    {copyMsg||"Mesajı Kopyala"}
+                  </button>
+                </div>
+                <button style={S.btnGhost} onClick={() => setView("home")}>Ana Sayfaya Dön</button>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ── ADMIN VIEW ────────────────────────────────────────────────────────────
+    function AdminView({ year, month, setYear, setMonth, reservations, config, setView }) {
+      const [tab, setTab]         = useState("calendar");
+      const [ampmModal, setAmpmModal] = useState(null);
+      const [editRes, setEditRes] = useState(null);
+      const [copyMsg, setCopyMsg] = useState("");
+      const days = buildDays(year, month);
+
+      const setDayType = async (dateStr, type) => {
+        await fbSetDayConfig(dateStr, type);
+      };
+
+      const cancelReservation = async (dateStr, slot) => {
+        if (!confirm("Bu rezervasyonu iptal etmek istiyor musunuz?")) return;
+        await fbCancelReservation(dateStr, slot);
+        setEditRes(null);
+      };
+
+      const exportList = () => {
+        let txt = "Tarih\tGün\tSaat\tAd\tSoyad\tTelefon\n";
+        for (const dateStr of Object.keys(reservations).sort()) {
+          for (const r of reservations[dateStr]) {
+            txt += `${dateStr}\t${displayDate(dateStr)}\t${r.slot}\t${r.ad}\t${r.soyad}\t${r.tel}\n`;
+          }
+        }
+        navigator.clipboard.writeText(txt).then(() => {
+          setCopyMsg("Kopyalandı! Excel'e yapıştırabilirsiniz.");
+          setTimeout(()=>setCopyMsg(""),3000);
+        });
+      };
+
+      const allRes = [];
+      for (const d of Object.keys(reservations).sort())
+        (reservations[d]||[]).forEach(r => allRes.push({dateStr:d,...r}));
+
+      const prevMonth = () => { if(month===1){setMonth(12);setYear(y=>y-1);}else setMonth(m=>m-1); };
+      const nextMonth = () => { if(month===12){setMonth(1);setYear(y=>y+1);}else setMonth(m=>m+1); };
+
+      return (
+        <div style={S.page}>
+          <div style={{...S.card, maxWidth:720}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+              <button style={S.backBtn} onClick={() => setView("home")}>← Çıkış</button>
+              <h2 style={{...S.title,marginBottom:0}}>Yönetici Paneli</h2>
+              <div style={{width:60}} />
+            </div>
+
+            {/* Month nav */}
+            <div style={S.monthSel}>
+              <button style={S.navBtn} onClick={prevMonth}>‹</button>
+              <span style={{fontWeight:700,fontSize:16,fontFamily:"'DM Sans',sans-serif",minWidth:150,textAlign:"center"}}>
+                {MONTH_NAMES[month]} {year}
+              </span>
+              <button style={S.navBtn} onClick={nextMonth}>›</button>
+            </div>
+
+            {/* Tabs */}
+            <div style={S.tabs}>
+              {[["calendar","📅 Takvim"],["list","📋 Liste"]].map(([t,l]) => (
+                <button key={t} onClick={()=>setTab(t)}
+                  style={{...S.tabBtn, background:tab===t?"#1e40af":"transparent", color:tab===t?"#fff":"#64748b"}}>
+                  {l}
+                </button>
+              ))}
+              <button onClick={exportList}
+                style={{...S.tabBtn,marginLeft:"auto",background:"#f0fdf4",color:"#16a34a"}}>
+                📊 Excel'e Kopyala
+              </button>
+            </div>
+            {copyMsg && <p style={{color:"#16a34a",fontSize:13,marginBottom:8,fontFamily:"'DM Sans',sans-serif"}}>{copyMsg}</p>}
+
+            {/* CALENDAR */}
+            {tab==="calendar" && (
+              <div style={S.adminGrid}>
+                {days.map(d => {
+                  const dateStr = fmt(year, month, d);
+                  const slots   = getSlotsForDay(dateStr, config);
+                  const booked  = reservations[dateStr] || [];
+                  const cfgType = config[dateStr]?.type || "8";
+                  return (
+                    <div key={d} style={S.adminDay}>
+                      <div style={{display:"flex",justifyContent:"space-between",marginBottom:8,fontFamily:"'DM Sans',sans-serif"}}>
+                        <span style={{fontWeight:700,fontSize:14}}>{d} {MONTH_NAMES[month]}</span>
+                        <span style={{fontSize:11,color:"#94a3b8"}}>{booked.length}/{slots.length}</span>
+                      </div>
+                      {/* Type buttons */}
+                      <div style={{display:"flex",gap:4,marginBottom:8,flexWrap:"wrap"}}>
+                        {[{key:"8",label:"8 kişi"},{key:"4",label:"4 kişi"},{key:"closed",label:"Kapalı"}].map(t => {
+                          const active = t.key==="4" ? (cfgType==="4am"||cfgType==="4pm") : cfgType===t.key;
+                          const bg  = t.key==="closed"?"#fee2e2":t.key==="4"?"#fef9c3":"#dbeafe";
+                          const col = t.key==="closed"?"#dc2626":t.key==="4"?"#b45309":"#1e40af";
+                          return (
+                            <button key={t.key}
+                              onClick={() => t.key==="4" ? setAmpmModal(dateStr) : setDayType(dateStr,t.key)}
+                              style={{padding:"2px 8px",borderRadius:6,border:"none",cursor:"pointer",fontSize:11,fontWeight:600,
+                                background:active?bg:"#f1f5f9", color:active?col:"#94a3b8"}}>
+                              {t.label}
+                              {t.key==="4"&&cfgType==="4am"&&" (ÖÖ)"}
+                              {t.key==="4"&&cfgType==="4pm"&&" (ÖS)"}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {/* Slot pills */}
+                      <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+                        {slots.map(slot => {
+                          const res = booked.find(r=>r.slot===slot);
+                          return (
+                            <div key={slot} onClick={() => res && setEditRes({dateStr,slot,res})}
+                              style={{padding:"3px 8px",borderRadius:6,fontSize:11,fontWeight:600,
+                                background:res?"#1e40af":"#f1f5f9",color:res?"#fff":"#94a3b8",
+                                cursor:res?"pointer":"default",minWidth:46,textAlign:"center"}}>
+                              {slot}
+                              {res && <div style={{fontSize:10,opacity:0.85}}>{res.ad}</div>}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* LIST */}
+            {tab==="list" && (
+              <div style={{overflowX:"auto"}}>
+                {allRes.length===0
+                  ? <p style={{color:"#94a3b8",textAlign:"center",padding:32,fontFamily:"'DM Sans',sans-serif"}}>Henüz rezervasyon yok.</p>
+                  : (
+                    <table style={S.table}>
+                      <thead>
+                        <tr>{["Tarih","Saat","Ad","Soyad","Telefon",""].map(h=><th key={h} style={S.th}>{h}</th>)}</tr>
+                      </thead>
+                      <tbody>
+                        {allRes.map((r,i) => (
+                          <tr key={i} style={{background:i%2===0?"#fff":"#f8fafc"}}>
+                            <td style={S.td}>{displayDate(r.dateStr)}</td>
+                            <td style={{...S.td,fontWeight:700}}>{r.slot}</td>
+                            <td style={S.td}>{r.ad}</td>
+                            <td style={S.td}>{r.soyad}</td>
+                            <td style={S.td}>{r.tel}</td>
+                            <td style={S.td}>
+                              <button style={S.btnRed} onClick={()=>cancelReservation(r.dateStr,r.slot)}>İptal</button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )
+                }
+              </div>
+            )}
+
+            {/* AM/PM MODAL */}
+            {ampmModal && (
+              <div style={S.modal} onClick={()=>setAmpmModal(null)}>
+                <div style={{...S.modalBox,maxWidth:340,textAlign:"center"}} onClick={e=>e.stopPropagation()}>
+                  <div style={{fontSize:36,marginBottom:8}}>🕐</div>
+                  <h3 style={{fontFamily:"'Playfair Display',serif",marginBottom:8,color:"#1e293b"}}>Oturum Zamanı</h3>
+                  <p style={{color:"#64748b",fontSize:14,marginBottom:24,fontFamily:"'DM Sans',sans-serif"}}>
+                    {displayDate(ampmModal)} günü için 4 kişilik kontenjan hangi yarıda?
+                  </p>
+                  <div style={{display:"flex",gap:12}}>
+                    <button onClick={()=>{setDayType(ampmModal,"4am");setAmpmModal(null);}}
+                      style={{flex:1,padding:"14px 0",borderRadius:12,border:"2px solid #bfdbfe",
+                        background:"#eff6ff",color:"#1e40af",fontWeight:700,cursor:"pointer",
+                        fontFamily:"'DM Sans',sans-serif",fontSize:14}}>
+                      ☀️ Öğleden Önce<br/>
+                      <span style={{fontSize:11,fontWeight:400,color:"#3b82f6"}}>10:00 – 11:30</span>
+                    </button>
+                    <button onClick={()=>{setDayType(ampmModal,"4pm");setAmpmModal(null);}}
+                      style={{flex:1,padding:"14px 0",borderRadius:12,border:"2px solid #fde68a",
+                        background:"#fffbeb",color:"#b45309",fontWeight:700,cursor:"pointer",
+                        fontFamily:"'DM Sans',sans-serif",fontSize:14}}>
+                      🌤 Öğleden Sonra<br/>
+                      <span style={{fontSize:11,fontWeight:400,color:"#d97706"}}>13:30 – 15:00</span>
+                    </button>
+                  </div>
+                  <button style={S.btnGhost} onClick={()=>setAmpmModal(null)}>İptal</button>
+                </div>
+              </div>
+            )}
+
+            {/* SLOT DETAIL MODAL */}
+            {editRes && (
+              <div style={S.modal} onClick={()=>setEditRes(null)}>
+                <div style={S.modalBox} onClick={e=>e.stopPropagation()}>
+                  <h3 style={{fontFamily:"'Playfair Display',serif",marginBottom:16,color:"#1e293b"}}>Rezervasyon Detayı</h3>
+                  <div style={S.confirmBox}>
+                    <p><b>{editRes.res.ad} {editRes.res.soyad}</b></p>
+                    <p>{displayDate(editRes.dateStr)} — {editRes.slot}</p>
+                    <p>📞 {editRes.res.tel}</p>
+                  </div>
+                  <div style={S.waBox}>
+                    <p style={{fontWeight:600,marginBottom:6,color:"#1e293b",fontSize:13,fontFamily:"'DM Sans',sans-serif"}}>WhatsApp Mesajı</p>
+                    <p style={{fontSize:12,color:"#475569",marginBottom:10,lineHeight:1.6,fontFamily:"'DM Sans',sans-serif"}}>
+                      {waText(`${editRes.res.ad} ${editRes.res.soyad}`, editRes.dateStr, editRes.slot)}
+                    </p>
+                    <button style={S.btnGreen} onClick={() => {
+                      const msg = waText(`${editRes.res.ad} ${editRes.res.soyad}`, editRes.dateStr, editRes.slot);
+                      navigator.clipboard.writeText(msg).then(()=>{setCopyMsg("Mesaj kopyalandı!");setTimeout(()=>setCopyMsg(""),2000);});
+                    }}>Mesajı Kopyala</button>
+                  </div>
+                  <button onClick={()=>cancelReservation(editRes.dateStr,editRes.slot)}
+                    style={{...S.btnBlue,background:"#ef4444",marginTop:8}}>
+                    Rezervasyonu İptal Et
+                  </button>
+                  <button style={S.btnGhost} onClick={()=>setEditRes(null)}>Kapat</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
