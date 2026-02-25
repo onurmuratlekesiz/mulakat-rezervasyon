@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mülakat Randevu Sistemi</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=Playfair+Display:wght@700&display=swap" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+    import { getFirestore, doc, getDoc, setDoc, collection, onSnapshot }
+      from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+    import { getAuth, signInWithEmailAndPassword, signOut }
+      from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+
+    const app = initializeApp({
+      apiKey:            "AIzaSyCLdA14t9BjDgbnh_C-JOoovtS1V5Cqj6w",
+      authDomain:        "mulakat-rezervasyon.firebaseapp.com",
+      projectId:         "mulakat-rezervasyon",
+      storageBucket:     "mulakat-rezervasyon.firebasestorage.app",
+      messagingSenderId: "1046752791579",
+      appId:             "1:1046752791579:web:84f667b36932a0511a3cbe"
+    });
+    window._db  = getFirestore(app);
+    window._auth = getAuth(app);
+    window._fb  = { doc, getDoc, setDoc, collection, onSnapshot, signInWithEmailAndPassword, signOut };
+    window._dbReady = true;
+    window.dispatchEvent(new Event("fb-ready"));
+  </script>
+
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 50%,#0f172a 100%);min-height:100vh}
+    @keyframes spin   {to{transform:rotate(360deg)}}
+    @keyframes fadeIn {from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+    @media print{body{background:#fff!important}.no-print{display:none!important}}
+    input:focus{outline:2px solid #3b82f6;border-color:#3b82f6!important}
+    textarea:focus{outline:2px solid #3b82f6;border-color:#3b82f6!important}
+    button:hover{filter:brightness(0.92)}
+    ::-webkit-scrollbar{width:6px}
+    ::-webkit-scrollbar-track{background:#f1f5f9}
+    ::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
+  </style>
+</head>
+<body><div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useMemo } = React;
+
+// ── CONSTANTS ──────────────────────────────────────────────────────────────
+const SLOTS_8    = ["10:00","10:30","11:00","11:30","13:30","14:00","14:30","15:00"];
+const SLOTS_4_AM = ["10:00","10:30","11:00","11:30"];
+const SLOTS_4_PM = ["13:30","14:00","14:30","15:00"];
+const MONTHS  = ["","Ocak","Şubat","Mart","Nisan","Mayıs","Haziran","Temmuz","Ağustos","Eylül","Ekim","Kasım","Aralık"];
+const DAYS    = ["Pazar","Pazartesi","Salı","Çarşamba","Perşembe","Cuma","Cumartesi"];
+const DAYS_SHORT = ["Paz","Pzt","Sal","Çar","Per","Cum","Cmt"];
+
+// ── VALIDATION ─────────────────────────────────────────────────────────────
+const validatePhone = v => /^05[0-9]{9}$/.test(v);
+const sanitizePhone = v => v.replace(/[^0-9]/g,"").slice(0,11);
+const sanitizeName  = v => v.replace(/[^a-zA-ZğüşıöçĞÜŞİÖÇ\s\-]/g,"").slice(0,50);
+
+// ── HELPERS ────────────────────────────────────────────────────────────────
+function fmt(y,m,d){ return `${y}-${String(m).padStart(2,"0")}-${String(d).padStart(2,"0")}`; }
+
+function displayDate(ds){
+  const [y,m,d]=ds.split("-").map(Number);
+  return `${DAYS[new Date(y,m-1,d).getDay()]}, ${d} ${MONTHS[m]} ${y}`;
+}
+
+function getDow(ds){ const [y,m,d]=ds.split("-").map(Number); return new Date(y,m-1,d).getDay(); }
+
+// Tüm takvim hücrelerini döner (boş+dolu, 7 sütunlu grid için)
+function buildCalendarGrid(year, month){
+  const total = new Date(year, month, 0).getDate();
+  const cells = [];
+  for(let d=1;d<=total;d++){
+    const ds  = fmt(year,month,d);
+    const dow = new Date(year,month-1,d).getDay();
+    cells.push({ d, ds, dow, isWeekend: dow===0||dow===6 });
+  }
+  // Ayın ilk gününün haftanın kaçıncı günü (Pzt=0)
+  const firstDow = (new Date(year,month-1,1).getDay()+6)%7; // Mon-based
+  const padded = [];
+  for(let i=0;i<firstDow;i++) padded.push(null);
+  cells.forEach(c => padded.push(c));
+  return padded;
+}
+
+function getSlotsForDay(ds, config){
+  const t = config[ds]?.type;
+  if(!t||t==="8") return SLOTS_8;
+  if(t==="4am")   return SLOTS_4_AM;
+  if(t==="4pm")   return SLOTS_4_PM;
+  if(t==="closed")return [];
+  return SLOTS_8;
+}
+
+function isToday(ds){
+  const now = new Date();
+  return ds === fmt(now.getFullYear(), now.getMonth()+1, now.getDate());
+}
+
+function isPast(ds){
+  const now = new Date(); now.setHours(0,0,0,0);
+  const [y,m,d]=ds.split("-").map(Number);
+  return new Date(y,m-1,d) < now;
+}
+
+function phoneExists(tel, reservations){
+  return Object.values(reservations).flat().some(r=>r.tel===tel);
+}
+
+// ── FIREBASE ───────────────────────────────────────────────────────────────
+async function waitFb(){ if(!window._dbReady) await new Promise(r=>window.addEventListener("fb-ready",r,{once:true})); }
+
+async function fbBook(ds, slotData){
+  await waitFb();
+  const {doc,getDoc,setDoc}=window._fb;
+  const ref=doc(window._db,"reservations",ds);
+  const snap=await getDoc(ref);
+  const slots=snap.exists()?(snap.data().slots||{}):{};
+  if(slots[slotData.slot]) throw new Error("DOLU");
+  slots[slotData.slot]={ad:slotData.ad,soyad:slotData.soyad,tel:slotData.tel,bookedAt:new Date().toISOString()};
+  await setDoc(ref,{slots});
+}
+
+async function fbCancel(ds, slot){
+  await waitFb();
+  const {doc,getDoc,setDoc}=window._fb;
+  const ref=doc(window._db,"reservations",ds);
+  const snap=await getDoc(ref);
+  if(!snap.exists()) return;
+  const slots=snap.data().slots||{};
+  delete slots[slot];
+  await setDoc(ref,{slots});
+}
+
+async function fbMove(ds, oldSlot, newSlot){
+  await waitFb();
+  const {doc,getDoc,setDoc}=window._fb;
+  const ref=doc(window._db,"reservations",ds);
+  const snap=await getDoc(ref);
+  if(!snap.exists()) return;
+  const slots=snap.data().slots||{};
+  if(slots[newSlot]) throw new Error("DOLU");
+  slots[newSlot]=slots[oldSlot];
+  delete slots[oldSlot];
+  await setDoc(ref,{slots});
+}
+
+async function fbSetType(ds, type){
+  await waitFb();
+  const {doc,getDoc,setDoc}=window._fb;
+  const ref=doc(window._db,"config",ds);
+  const snap=await getDoc(ref);
+  const existing=snap.exists()?snap.data():{};
+  await setDoc(ref,{...existing,type});
+}
+
+async function fbSetNote(ds, note){
+  await waitFb();
+  const {doc,getDoc,setDoc}=window._fb;
+  const ref=doc(window._db,"config",ds);
+  const snap=await getDoc(ref);
+  const existing=snap.exists()?snap.data():{type:"8"};
+  await setDoc(ref,{...existing,note});
+}
+
+function fbSubscribe(onRes,onCfg){
+  if(!window._dbReady){ window.addEventListener("fb-ready",()=>fbSubscribe(onRes,onCfg),{once:true}); return ()=>{}; }
+  const {collection,onSnapshot}=window._fb;
+  const u1=onSnapshot(collection(window._db,"reservations"),snap=>{
+    const r={};
+    snap.forEach(d=>{ r[d.id]=Object.entries(d.data().slots||{}).map(([slot,info])=>({slot,...info})); });
+    onRes(r);
+  });
+  const u2=onSnapshot(collection(window._db,"config"),snap=>{
+    const c={};
+    snap.forEach(d=>{ c[d.id]=d.data(); });
+    onCfg(c);
+  });
+  return ()=>{ u1(); u2(); };
+}
+
+// ── STYLES ─────────────────────────────────────────────────────────────────
+const S={
+  page:     {minHeight:"100vh",display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"32px 16px 64px"},
+  card:     {background:"#fff",borderRadius:20,padding:"32px 28px",maxWidth:640,width:"100%",boxShadow:"0 25px 50px rgba(0,0,0,0.35)",marginTop:24,animation:"fadeIn 0.3s ease"},
+  homeCard: {background:"rgba(255,255,255,0.05)",backdropFilter:"blur(20px)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:24,padding:"56px 40px",maxWidth:440,width:"100%",textAlign:"center",marginTop:64,animation:"fadeIn 0.4s ease"},
+  badge:    {display:"inline-block",background:"rgba(59,130,246,0.15)",color:"#93c5fd",border:"1px solid rgba(59,130,246,0.3)",borderRadius:100,padding:"4px 16px",fontSize:11,fontWeight:700,letterSpacing:2,marginBottom:24,textTransform:"uppercase"},
+  heroTitle:{fontFamily:"'Playfair Display',serif",fontSize:42,color:"#f1f5f9",lineHeight:1.2,marginBottom:16},
+  heroSub:  {color:"#94a3b8",fontSize:15,lineHeight:1.7,marginBottom:36},
+  title:    {fontFamily:"'Playfair Display',serif",fontSize:26,color:"#1e293b",marginBottom:4},
+  sub:      {color:"#64748b",fontSize:14,marginBottom:20,fontFamily:"'DM Sans',sans-serif"},
+  backBtn:  {background:"none",border:"none",color:"#64748b",cursor:"pointer",fontSize:13,fontWeight:600,padding:0,marginBottom:16,display:"block",fontFamily:"'DM Sans',sans-serif"},
+  input:    {width:"100%",padding:"12px 16px",border:"2px solid #e2e8f0",borderRadius:12,fontSize:14,color:"#1e293b",fontFamily:"'DM Sans',sans-serif",marginBottom:12,display:"block"},
+  btnBlue:  {width:"100%",padding:"14px 24px",background:"linear-gradient(135deg,#1e40af,#3b82f6)",color:"#fff",border:"none",borderRadius:12,fontSize:15,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",marginTop:8,display:"block"},
+  btnGhost: {width:"100%",padding:"12px 24px",background:"transparent",color:"#475569",border:"2px solid #e2e8f0",borderRadius:12,fontSize:14,fontWeight:600,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",marginTop:8,display:"block"},
+  btnGreen: {padding:"10px 20px",background:"#16a34a",color:"#fff",border:"none",borderRadius:10,fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"},
+  btnRed:   {padding:"6px 12px",borderRadius:8,border:"none",background:"#fee2e2",color:"#dc2626",cursor:"pointer",fontSize:12,fontWeight:600,fontFamily:"'DM Sans',sans-serif"},
+  errMsg:   {color:"#ef4444",fontSize:13,marginBottom:8,fontFamily:"'DM Sans',sans-serif"},
+  steps:    {display:"flex",marginBottom:28,alignItems:"center",justifyContent:"center"},
+  stepItem: {display:"flex",flexDirection:"column",alignItems:"center",gap:4,flex:1},
+  stepDot:  {width:28,height:28,borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700},
+  slotGrid: {display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8},
+  slotBtn:  {padding:"12px 8px",borderRadius:10,border:"2px solid #e2e8f0",fontSize:14,fontWeight:700,fontFamily:"'DM Sans',sans-serif",textAlign:"center"},
+  confirmBox:{background:"#f8fafc",borderRadius:12,padding:"16px 20px",marginBottom:16,lineHeight:1.8,fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#374151"},
+  tabs:     {display:"flex",gap:6,marginBottom:16,flexWrap:"wrap",alignItems:"center"},
+  tabBtn:   {padding:"8px 16px",borderRadius:8,border:"none",cursor:"pointer",fontSize:13,fontWeight:600,fontFamily:"'DM Sans',sans-serif"},
+  adminDay: {background:"#f8fafc",borderRadius:12,padding:"10px 12px",border:"1px solid #e2e8f0"},
+  table:    {width:"100%",borderCollapse:"collapse",fontSize:13,fontFamily:"'DM Sans',sans-serif"},
+  th:       {background:"#1e40af",color:"#fff",padding:"10px 12px",textAlign:"left",fontWeight:700},
+  td:       {padding:"9px 12px",borderBottom:"1px solid #e2e8f0",color:"#374151"},
+  modal:    {position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,padding:16},
+  modalBox: {background:"#fff",borderRadius:20,padding:"28px 24px",maxWidth:420,width:"100%",boxShadow:"0 25px 50px rgba(0,0,0,0.3)",animation:"fadeIn 0.2s ease"},
+  monthSel: {display:"flex",alignItems:"center",justifyContent:"center",gap:20,marginBottom:16},
+  navBtn:   {width:32,height:32,borderRadius:8,border:"2px solid #e2e8f0",background:"#f8fafc",cursor:"pointer",fontSize:20,display:"flex",alignItems:"center",justifyContent:"center"},
+  spinner:  {width:36,height:36,borderRadius:"50%",border:"3px solid #e2e8f0",borderTop:"3px solid #3b82f6",animation:"spin 0.7s linear infinite",margin:"0 auto"},
+};
+
+// ── APP ────────────────────────────────────────────────────────────────────
+function App(){
+  const [view,setView]     = useState("home");
+  const [res,setRes]       = useState({});
+  const [cfg,setCfg]       = useState({});
+  const [year,setYear]     = useState(2026);
+  const [month,setMonth]   = useState(3);
+  const [ready,setReady]   = useState(false);
+
+  useEffect(()=>{
+    return fbSubscribe(r=>{setRes(r);setReady(true);}, c=>setCfg(c));
+  },[]);
+
+  if(!ready) return(
+    <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:16}}>
+      <div style={S.spinner}/><p style={{color:"#94a3b8",fontFamily:"'DM Sans',sans-serif",fontSize:14}}>Bağlanıyor…</p>
+    </div>
+  );
+
+  const p={res,cfg,year,month,setYear,setMonth,setView};
+  return(<>
+    {view==="home"       && <HomeView setView={setView}/>}
+    {view==="adminLogin" && <AdminLogin setView={setView}/>}
+    {view==="book"       && <BookView {...p}/>}
+    {view==="admin"      && <AdminView {...p}/>}
+  </>);
+}
+
+// ── HOME ───────────────────────────────────────────────────────────────────
+function HomeView({setView}){
+  return(
+    <div style={S.page}>
+      <div style={S.homeCard}>
+        <div style={S.badge}>Mülakat 2026</div>
+        <h1 style={S.heroTitle}>Mülakat<br/>Randevu Sistemi</h1>
+        <p style={S.heroSub}>Uygun gün ve saatinizi seçerek randevunuzu kolayca oluşturun.</p>
+        <div style={{display:"flex",gap:12,flexDirection:"column",maxWidth:320,margin:"0 auto"}}>
+          <button style={S.btnBlue}  onClick={()=>setView("book")}>🗓 Randevu Al</button>
+          <button style={S.btnGhost} onClick={()=>setView("adminLogin")}>🔐 Yönetici Girişi</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── ADMIN LOGIN ────────────────────────────────────────────────────────────
+function AdminLogin({setView}){
+  const [email,setEmail]=useState("");
+  const [pass,setPass]=useState("");
+  const [err,setErr]=useState("");
+  const [loading,setLoading]=useState(false);
+  const tryLogin=async()=>{
+    if(!email||!pass) return;
+    setLoading(true);setErr("");
+    try{
+      await waitFb();
+      await window._fb.signInWithEmailAndPassword(window._auth,email,pass);
+      setView("admin");
+    }catch{setErr("E-posta veya şifre hatalı.");}
+    setLoading(false);
+  };
+  return(
+    <div style={S.page}>
+      <div style={{...S.card,maxWidth:380}}>
+        <button style={S.backBtn} onClick={()=>setView("home")}>← Geri</button>
+        <h2 style={S.title}>Yönetici Girişi</h2>
+        <input type="email" placeholder="E-posta" value={email} onChange={e=>setEmail(e.target.value)} style={{...S.input,marginTop:16}}/>
+        <input type="password" placeholder="Şifre" value={pass} onChange={e=>setPass(e.target.value)} onKeyDown={e=>e.key==="Enter"&&tryLogin()} style={{...S.input,borderColor:err?"#ef4444":"#e2e8f0"}}/>
+        {err&&<p style={S.errMsg}>⚠️ {err}</p>}
+        <button style={{...S.btnBlue,opacity:loading?0.6:1}} disabled={loading} onClick={tryLogin}>{loading?"Giriş yapılıyor…":"Giriş Yap"}</button>
+      </div>
+    </div>
+  );
+}
+
+// ── BOOK VIEW ──────────────────────────────────────────────────────────────
+function BookView({year,month,res,cfg,setView}){
+  const [step,setStep]     = useState(1);
+  const [selDate,setSelDate] = useState(null);
+  const [selSlot,setSelSlot] = useState(null);
+  const [form,setForm]     = useState({ad:"",soyad:"",tel:""});
+  const [saving,setSaving] = useState(false);
+  const [error,setError]   = useState("");
+
+  const telValid = validatePhone(form.tel);
+  const telDirty = form.tel.length>0;
+  const canSubmit = form.ad.trim()&&form.soyad.trim()&&telValid&&!saving;
+
+  const grid = buildCalendarGrid(year,month);
+
+  const handleBook=async()=>{
+    if(!validatePhone(form.tel)){setError("Geçersiz telefon numarası.");return;}
+    if(phoneExists(form.tel,res)){setError("Bu telefon numarasıyla daha önce randevu alınmış.");return;}
+    setSaving(true);setError("");
+    try{
+      await fbBook(selDate,{slot:selSlot,...form});
+      setStep(4);
+    }catch(e){
+      setError(e.message==="DOLU"?"Bu saat az önce doldu, lütfen başka bir saat seçin.":"Bir hata oluştu, tekrar deneyin.");
+    }
+    setSaving(false);
+  };
+
+  return(
+    <div style={S.page}>
+      <div style={S.card}>
+        <button className="no-print" style={S.backBtn} onClick={()=>step>1?setStep(step-1):setView("home")}>← Geri</button>
+
+        {/* Steps */}
+        <div style={S.steps} className="no-print">
+          {["Gün","Saat","Bilgi","Tamamlandı"].map((s,i)=>(
+            <div key={i} style={{...S.stepItem,opacity:i+1<=step?1:0.3}}>
+              <div style={{...S.stepDot,background:i+1<=step?"#1e40af":"#e2e8f0",color:i+1<=step?"#fff":"#94a3b8"}}>{i+1}</div>
+              <span style={{fontSize:11,color:i+1<=step?"#1e40af":"#94a3b8",fontWeight:600,fontFamily:"'DM Sans',sans-serif"}}>{s}</span>
+            </div>
+          ))}
+        </div>
+
+        {/* STEP 1 — Gün (gerçek takvim grid) */}
+        {step===1&&<>
+          <h2 style={S.title}>Gün Seçin</h2>
+          <p style={S.sub}>{MONTHS[month]} {year}</p>
+
+          {/* Hafta başlıkları */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4,marginBottom:4}}>
+            {["Pzt","Sal","Çar","Per","Cum","Cmt","Paz"].map(d=>(
+              <div key={d} style={{textAlign:"center",fontSize:11,fontWeight:700,color:d==="Cmt"||d==="Paz"?"#cbd5e1":"#94a3b8",padding:"4px 0",fontFamily:"'DM Sans',sans-serif"}}>
+                {d}
+              </div>
+            ))}
+          </div>
+
+          {/* Takvim grid */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4}}>
+            {grid.map((cell,i)=>{
+              if(!cell) return <div key={`e-${i}`}/>;
+              const {d,ds,isWeekend}=cell;
+              const slots     = getSlotsForDay(ds,cfg);
+              const booked    = (res[ds]||[]).length;
+              const available = slots.length-booked;
+              const closed    = slots.length===0;
+              const past      = isPast(ds);
+              const today     = isToday(ds);
+              const disabled  = isWeekend||closed||available===0||past;
+              const pct       = slots.length>0?Math.round((booked/slots.length)*100):0;
+
+              return(
+                <button key={ds} disabled={disabled}
+                  onClick={()=>{setSelDate(ds);setStep(2);}}
+                  style={{
+                    padding:"8px 4px",borderRadius:10,
+                    border:today?"2px solid #3b82f6":"2px solid #e2e8f0",
+                    background:isWeekend?"#f8fafc":past?"#f8fafc":"#fff",
+                    display:"flex",flexDirection:"column",alignItems:"center",gap:2,
+                    fontFamily:"'DM Sans',sans-serif",
+                    opacity:isWeekend||past?0.35:1,
+                    cursor:disabled?"not-allowed":"pointer",
+                    position:"relative",overflow:"hidden",
+                    minHeight:60,
+                  }}>
+                  {/* Doluluk bar */}
+                  {!closed&&!isWeekend&&!past&&slots.length>0&&(
+                    <div style={{position:"absolute",bottom:0,left:0,height:3,width:`${pct}%`,
+                      background:pct===100?"#ef4444":pct>=75?"#f59e0b":"#22c55e",borderRadius:2}}/>
+                  )}
+                  <span style={{fontSize:16,fontWeight:700,color:today?"#1e40af":isWeekend||past?"#cbd5e1":"#1e293b"}}>{d}</span>
+                  {!isWeekend&&!past&&(
+                    <span style={{fontSize:9,fontWeight:600,lineHeight:1.1,textAlign:"center",
+                      color:closed?"#94a3b8":available===0?"#ef4444":available<=2?"#f59e0b":"#22c55e"}}>
+                      {closed?"kapalı":available===0?"dolu":`${available} boş`}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </>}
+
+        {/* STEP 2 — Saat */}
+        {step===2&&selDate&&<>
+          <h2 style={S.title}>Saat Seçin</h2>
+          <p style={S.sub}>{displayDate(selDate)}</p>
+          {cfg[selDate]?.note&&(
+            <div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:10,padding:"10px 14px",marginBottom:16,fontSize:13,color:"#92400e",fontFamily:"'DM Sans',sans-serif"}}>
+              📌 {cfg[selDate].note}
+            </div>
+          )}
+          <div style={S.slotGrid}>
+            {getSlotsForDay(selDate,cfg).map(slot=>{
+              const booked=(res[selDate]||[]).some(r=>r.slot===slot);
+              return(
+                <button key={slot} disabled={booked}
+                  onClick={()=>{setSelSlot(slot);setStep(3);}}
+                  style={{...S.slotBtn,opacity:booked?0.35:1,
+                    background:selSlot===slot?"#1e40af":"#f8fafc",
+                    color:selSlot===slot?"#fff":"#1e293b",
+                    cursor:booked?"not-allowed":"pointer"}}>
+                  {slot}
+                  {booked&&<div style={{fontSize:10,color:"#ef4444"}}>Dolu</div>}
+                </button>
+              );
+            })}
+          </div>
+        </>}
+
+        {/* STEP 3 — Bilgi */}
+        {step===3&&<>
+          <h2 style={S.title}>Bilgileriniz</h2>
+          <p style={S.sub}>{displayDate(selDate)} — {selSlot}</p>
+          <input placeholder="Ad" value={form.ad} onChange={e=>setForm({...form,ad:sanitizeName(e.target.value)})} style={{...S.input,marginTop:16}}/>
+          <input placeholder="Soyad" value={form.soyad} onChange={e=>setForm({...form,soyad:sanitizeName(e.target.value)})} style={S.input}/>
+          <input placeholder="Telefon (05XXXXXXXXX)" value={form.tel} inputMode="numeric"
+            onChange={e=>setForm({...form,tel:sanitizePhone(e.target.value)})}
+            style={{...S.input,borderColor:telDirty?(telValid?"#22c55e":"#ef4444"):"#e2e8f0"}}/>
+          {telDirty&&!telValid&&<p style={S.errMsg}>05XX ile başlayan 11 haneli numara giriniz</p>}
+          {error&&<p style={S.errMsg}>⚠️ {error}</p>}
+          <button style={{...S.btnBlue,opacity:canSubmit?1:0.45}} disabled={!canSubmit} onClick={handleBook}>
+            {saving?"⏳ Kaydediliyor…":"Randevuyu Kaydet →"}
+          </button>
+        </>}
+
+        {/* STEP 4 — Tamamlandı */}
+        {step===4&&(
+          <div style={{textAlign:"center"}}>
+            <div style={{fontSize:64,marginBottom:8}}>✅</div>
+            <h2 style={{...S.title,color:"#16a34a",textAlign:"center"}}>Randevunuz Alındı!</h2>
+            <p style={{...S.sub,textAlign:"center"}}>Aşağıdaki bilgileri not alabilir veya yazdırabilirsiniz.</p>
+            <div style={{...S.confirmBox,border:"2px solid #e2e8f0",textAlign:"left"}}>
+              <div style={{borderBottom:"1px solid #e2e8f0",paddingBottom:12,marginBottom:12}}>
+                <p style={{fontWeight:700,fontSize:15,fontFamily:"'Playfair Display',serif",color:"#1e293b"}}>Mülakat Randevu Belgesi</p>
+              </div>
+              <table style={{width:"100%",fontSize:14,borderCollapse:"collapse"}}>
+                <tbody>
+                  {[["Ad Soyad",`${form.ad} ${form.soyad}`],["Tarih",displayDate(selDate)],["Saat",selSlot],["Telefon",form.tel]].map(([k,v])=>(
+                    <tr key={k}><td style={{padding:"6px 0",color:"#64748b",width:90}}>{k}</td><td style={{padding:"6px 0",fontWeight:600,color:"#1e293b"}}>{v}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <button style={S.btnBlue} className="no-print" onClick={()=>window.print()}>🖨️ Yazdır / PDF Kaydet</button>
+            <button style={S.btnGhost} className="no-print" onClick={()=>setView("home")}>Ana Sayfaya Dön</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── ADMIN VIEW ─────────────────────────────────────────────────────────────
+function AdminView({year,month,setYear,setMonth,res,cfg,setView}){
+  const [tab,setTab]           = useState("calendar");
+  const [ampmModal,setAmpmModal] = useState(null);
+  const [editRes,setEditRes]   = useState(null);
+  const [moveModal,setMoveModal] = useState(null); // {dateStr,slot,res}
+  const [noteModal,setNoteModal] = useState(null);
+  const [search,setSearch]     = useState("");
+  const [copyMsg,setCopyMsg]   = useState("");
+
+  const grid = buildCalendarGrid(year,month);
+  const days = grid.filter(c=>c&&!c.isWeekend).map(c=>c.ds);
+
+  const setDayType = async(ds,type)=>{ await fbSetType(ds,type); };
+
+  const cancelReservation=async(ds,slot)=>{
+    if(!confirm("Bu rezervasyonu iptal etmek istiyor musunuz?")) return;
+    await fbCancel(ds,slot);
+    setEditRes(null);
+  };
+
+  const exportList=()=>{
+    let txt="Tarih\tGün\tSaat\tAd\tSoyad\tTelefon\n";
+    for(const ds of Object.keys(res).sort())
+      for(const r of res[ds])
+        txt+=`${ds}\t${displayDate(ds)}\t${r.slot}\t${r.ad}\t${r.soyad}\t${r.tel}\n`;
+    navigator.clipboard.writeText(txt).then(()=>{setCopyMsg("Kopyalandı! Excel'e yapıştırabilirsiniz.");setTimeout(()=>setCopyMsg(""),3000);});
+  };
+
+  // Tüm rezervasyonlar düz liste
+  const allRes=useMemo(()=>{
+    const list=[];
+    for(const ds of Object.keys(res).sort())
+      (res[ds]||[]).forEach(r=>list.push({dateStr:ds,...r}));
+    return list;
+  },[res]);
+
+  // Arama/filtreleme
+  const filteredRes=useMemo(()=>{
+    if(!search.trim()) return allRes;
+    const q=search.trim().toLowerCase();
+    return allRes.filter(r=>
+      r.ad.toLowerCase().includes(q)||
+      r.soyad.toLowerCase().includes(q)||
+      r.tel.includes(q)||
+      displayDate(r.dateStr).toLowerCase().includes(q)
+    );
+  },[allRes,search]);
+
+  // İstatistik
+  const totalBooked=allRes.length;
+  const totalSlots=days.reduce((s,ds)=>s+getSlotsForDay(ds,cfg).length,0);
+
+  const prevMonth=()=>{if(month===1){setMonth(12);setYear(y=>y-1);}else setMonth(m=>m-1);};
+  const nextMonth=()=>{if(month===12){setMonth(1);setYear(y=>y+1);}else setMonth(m=>m+1);};
+
+  return(
+    <div style={S.page}>
+      <div style={{...S.card,maxWidth:760}}>
+        {/* Header */}
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+          <button style={S.backBtn} onClick={async()=>{
+            await waitFb();
+            await window._fb.signOut(window._auth);
+            setView("home");
+          }}>← Çıkış</button>
+          <h2 style={{...S.title,marginBottom:0}}>Yönetici Paneli</h2>
+          <div style={{width:60}}/>
+        </div>
+
+        {/* İstatistik */}
+        <div style={{display:"flex",gap:10,marginBottom:16}}>
+          {[
+            {label:"Toplam Randevu",val:totalBooked,color:"#1e40af",bg:"#eff6ff"},
+            {label:"Dolu / Toplam", val:`${totalBooked}/${totalSlots}`,color:"#16a34a",bg:"#f0fdf4"},
+            {label:"Doluluk",       val:totalSlots>0?`${Math.round((totalBooked/totalSlots)*100)}%`:"—",color:"#b45309",bg:"#fffbeb"},
+          ].map(s=>(
+            <div key={s.label} style={{flex:1,background:s.bg,borderRadius:10,padding:"10px 14px",textAlign:"center"}}>
+              <div style={{fontSize:20,fontWeight:700,color:s.color,fontFamily:"'DM Sans',sans-serif"}}>{s.val}</div>
+              <div style={{fontSize:11,color:"#64748b",fontFamily:"'DM Sans',sans-serif"}}>{s.label}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Month nav */}
+        <div style={S.monthSel}>
+          <button style={S.navBtn} onClick={prevMonth}>‹</button>
+          <span style={{fontWeight:700,fontSize:16,fontFamily:"'DM Sans',sans-serif",minWidth:150,textAlign:"center"}}>{MONTHS[month]} {year}</span>
+          <button style={S.navBtn} onClick={nextMonth}>›</button>
+        </div>
+
+        {/* Tabs */}
+        <div style={S.tabs}>
+          {[["calendar","📅 Takvim"],["list","📋 Liste"]].map(([t,l])=>(
+            <button key={t} onClick={()=>setTab(t)}
+              style={{...S.tabBtn,background:tab===t?"#1e40af":"transparent",color:tab===t?"#fff":"#64748b"}}>{l}</button>
+          ))}
+          <button onClick={exportList} style={{...S.tabBtn,marginLeft:"auto",background:"#f0fdf4",color:"#16a34a"}}>📊 Excel'e Kopyala</button>
+        </div>
+        {copyMsg&&<p style={{color:"#16a34a",fontSize:13,marginBottom:8,fontFamily:"'DM Sans',sans-serif"}}>{copyMsg}</p>}
+
+        {/* CALENDAR TAB */}
+        {tab==="calendar"&&(
+          <>
+            {/* Hafta başlıkları */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4,marginBottom:4}}>
+              {["Pzt","Sal","Çar","Per","Cum","Cmt","Paz"].map(d=>(
+                <div key={d} style={{textAlign:"center",fontSize:11,fontWeight:700,color:d==="Cmt"||d==="Paz"?"#cbd5e1":"#64748b",padding:"4px 0",fontFamily:"'DM Sans',sans-serif"}}>{d}</div>
+              ))}
+            </div>
+
+            {/* Grid */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4,maxHeight:600,overflowY:"auto",paddingBottom:4}}>
+              {grid.map((cell,i)=>{
+                if(!cell) return <div key={`e-${i}`}/>;
+                const {d,ds,isWeekend}=cell;
+                const slots  = getSlotsForDay(ds,cfg);
+                const booked = res[ds]||[];
+                const cfgType= cfg[ds]?.type||"8";
+                const note   = cfg[ds]?.note||"";
+                const past   = isPast(ds);
+                const today  = isToday(ds);
+                const pct    = slots.length>0?Math.round((booked.length/slots.length)*100):0;
+
+                if(isWeekend) return(
+                  <div key={ds} style={{borderRadius:10,background:"#f8fafc",border:"1px solid #f1f5f9",padding:"6px 4px",display:"flex",alignItems:"center",justifyContent:"center",minHeight:120,opacity:0.4}}>
+                    <span style={{fontSize:14,color:"#cbd5e1",fontWeight:600}}>{d}</span>
+                  </div>
+                );
+
+                return(
+                  <div key={ds} style={{
+                    ...S.adminDay,
+                    border:today?"2px solid #3b82f6":note?"1.5px solid #fde68a":"1px solid #e2e8f0",
+                    opacity:past?0.45:1,
+                    minHeight:120,
+                  }}>
+                    {/* Başlık */}
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                      <span style={{fontWeight:700,fontSize:13,fontFamily:"'DM Sans',sans-serif",color:today?"#1e40af":"#1e293b"}}>{d}</span>
+                      <span style={{fontSize:10,color:"#94a3b8",fontFamily:"'DM Sans',sans-serif"}}>{booked.length}/{slots.length}</span>
+                    </div>
+
+                    {/* Doluluk bar */}
+                    {slots.length>0&&(
+                      <div style={{background:"#e2e8f0",borderRadius:4,height:4,marginBottom:6,overflow:"hidden"}}>
+                        <div style={{height:"100%",width:`${pct}%`,background:pct===100?"#ef4444":pct>=75?"#f59e0b":"#22c55e",borderRadius:4}}/>
+                      </div>
+                    )}
+
+                    {/* Tip butonları */}
+                    {!past&&(
+                      <div style={{display:"flex",gap:3,marginBottom:5,flexWrap:"wrap"}}>
+                        {[{key:"8",label:"8"},{key:"4",label:"4"},{key:"closed",label:"✕"}].map(t=>{
+                          const active=t.key==="4"?(cfgType==="4am"||cfgType==="4pm"):cfgType===t.key;
+                          const bg=t.key==="closed"?"#fee2e2":t.key==="4"?"#fef9c3":"#dbeafe";
+                          const col=t.key==="closed"?"#dc2626":t.key==="4"?"#b45309":"#1e40af";
+                          return(
+                            <button key={t.key} onClick={()=>t.key==="4"?setAmpmModal(ds):setDayType(ds,t.key)}
+                              style={{padding:"1px 6px",borderRadius:5,border:"none",cursor:"pointer",fontSize:10,fontWeight:700,
+                                background:active?bg:"#f1f5f9",color:active?col:"#94a3b8"}}>
+                              {t.label}{t.key==="4"&&cfgType==="4am"&&" ÖÖ"}{t.key==="4"&&cfgType==="4pm"&&" ÖS"}
+                            </button>
+                          );
+                        })}
+                        <button onClick={()=>setNoteModal({ds,note})}
+                          style={{padding:"1px 6px",borderRadius:5,border:"none",cursor:"pointer",fontSize:10,fontWeight:700,
+                            background:note?"#fef9c3":"#f1f5f9",color:note?"#b45309":"#94a3b8",marginLeft:"auto"}}>
+                          {note?"📌":"📝"}
+                        </button>
+                      </div>
+                    )}
+
+                    {note&&<div style={{fontSize:10,color:"#92400e",background:"#fffbeb",borderRadius:5,padding:"3px 6px",marginBottom:5,lineHeight:1.4}}>{note}</div>}
+
+                    {/* Slot pilleri */}
+                    <div style={{display:"flex",flexWrap:"wrap",gap:3}}>
+                      {slots.map(slot=>{
+                        const r=booked.find(r=>r.slot===slot);
+                        return(
+                          <div key={slot} onClick={()=>r&&setEditRes({dateStr:ds,slot,res:r})}
+                            style={{padding:"2px 5px",borderRadius:5,fontSize:10,fontWeight:600,
+                              background:r?"#1e40af":"#f1f5f9",color:r?"#fff":"#94a3b8",
+                              cursor:r?"pointer":"default",minWidth:38,textAlign:"center"}}>
+                            {slot}
+                            {r&&<div style={{fontSize:9,opacity:0.9,overflow:"hidden",maxWidth:38,textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.ad}</div>}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        {/* LIST TAB */}
+        {tab==="list"&&(
+          <>
+            {/* Arama */}
+            <div style={{position:"relative",marginBottom:12}}>
+              <span style={{position:"absolute",left:14,top:"50%",transform:"translateY(-50%)",fontSize:16,color:"#94a3b8"}}>🔍</span>
+              <input
+                placeholder="Ad, soyad, telefon veya tarih ara…"
+                value={search}
+                onChange={e=>setSearch(e.target.value)}
+                style={{...S.input,paddingLeft:40,marginBottom:0}}
+              />
+            </div>
+            <div style={{overflowX:"auto"}}>
+              {filteredRes.length===0
+                ?(
+                  <p style={{color:"#94a3b8",textAlign:"center",padding:32,fontFamily:"'DM Sans',sans-serif"}}>
+                    {search?"Arama sonucu bulunamadı.":"Henüz rezervasyon yok."}
+                  </p>
+                ):(
+                  <>
+                    <p style={{fontSize:12,color:"#94a3b8",marginBottom:8,fontFamily:"'DM Sans',sans-serif"}}>
+                      {search?`${filteredRes.length} sonuç bulundu`:`Toplam ${filteredRes.length} rezervasyon`}
+                    </p>
+                    <table style={S.table}>
+                      <thead>
+                        <tr>{["#","Tarih","Saat","Ad","Soyad","Telefon",""].map(h=><th key={h} style={S.th}>{h}</th>)}</tr>
+                      </thead>
+                      <tbody>
+                        {filteredRes.map((r,i)=>(
+                          <tr key={i} style={{background:i%2===0?"#fff":"#f8fafc"}}>
+                            <td style={{...S.td,color:"#94a3b8",width:32}}>{i+1}</td>
+                            <td style={S.td}>{displayDate(r.dateStr)}</td>
+                            <td style={{...S.td,fontWeight:700}}>{r.slot}</td>
+                            <td style={S.td}>{r.ad}</td>
+                            <td style={S.td}>{r.soyad}</td>
+                            <td style={S.td}>{r.tel}</td>
+                            <td style={S.td}>
+                              <div style={{display:"flex",gap:6}}>
+                                <button style={{...S.btnRed,background:"#eff6ff",color:"#1e40af"}}
+                                  onClick={()=>setMoveModal({dateStr:r.dateStr,slot:r.slot,res:r})}>Taşı</button>
+                                <button style={S.btnRed} onClick={()=>cancelReservation(r.dateStr,r.slot)}>İptal</button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </>
+                )
+              }
+            </div>
+          </>
+        )}
+
+        {/* AM/PM MODAL */}
+        {ampmModal&&(
+          <div style={S.modal} onClick={()=>setAmpmModal(null)}>
+            <div style={{...S.modalBox,maxWidth:340,textAlign:"center"}} onClick={e=>e.stopPropagation()}>
+              <div style={{fontSize:36,marginBottom:8}}>🕐</div>
+              <h3 style={{fontFamily:"'Playfair Display',serif",marginBottom:8,color:"#1e293b"}}>Oturum Zamanı</h3>
+              <p style={{color:"#64748b",fontSize:14,marginBottom:24,fontFamily:"'DM Sans',sans-serif"}}>{displayDate(ampmModal)} — 4 kişilik kontenjan hangi yarıda?</p>
+              <div style={{display:"flex",gap:12}}>
+                {[{type:"4am",icon:"☀️",label:"Öğleden Önce",sub:"10:00 – 11:30",border:"#bfdbfe",bg:"#eff6ff",col:"#1e40af",sub_col:"#3b82f6"},
+                  {type:"4pm",icon:"🌤",label:"Öğleden Sonra",sub:"13:30 – 15:00",border:"#fde68a",bg:"#fffbeb",col:"#b45309",sub_col:"#d97706"}
+                ].map(o=>(
+                  <button key={o.type} onClick={()=>{setDayType(ampmModal,o.type);setAmpmModal(null);}}
+                    style={{flex:1,padding:"14px 0",borderRadius:12,border:`2px solid ${o.border}`,background:o.bg,color:o.col,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",fontSize:14}}>
+                    {o.icon} {o.label}<br/><span style={{fontSize:11,fontWeight:400,color:o.sub_col}}>{o.sub}</span>
+                  </button>
+                ))}
+              </div>
+              <button style={S.btnGhost} onClick={()=>setAmpmModal(null)}>İptal</button>
+            </div>
+          </div>
+        )}
+
+        {/* NOT MODAL */}
+        {noteModal&&(
+          <NoteModal dateStr={noteModal.ds} initialNote={noteModal.note}
+            onSave={async note=>{await fbSetNote(noteModal.ds,note);setNoteModal(null);}}
+            onClose={()=>setNoteModal(null)}/>
+        )}
+
+        {/* REZERVASYON DETAY MODAL */}
+        {editRes&&(
+          <div style={S.modal} onClick={()=>setEditRes(null)}>
+            <div style={S.modalBox} onClick={e=>e.stopPropagation()}>
+              <h3 style={{fontFamily:"'Playfair Display',serif",marginBottom:16,color:"#1e293b"}}>Rezervasyon Detayı</h3>
+              <div style={S.confirmBox}>
+                <table style={{width:"100%",fontSize:14,borderCollapse:"collapse"}}>
+                  <tbody>
+                    {[["Ad Soyad",`${editRes.res.ad} ${editRes.res.soyad}`],["Tarih",displayDate(editRes.dateStr)],["Saat",editRes.slot],["Telefon",editRes.res.tel]].map(([k,v])=>(
+                      <tr key={k}><td style={{padding:"5px 0",color:"#64748b",width:80}}>{k}</td><td style={{padding:"5px 0",fontWeight:600,color:"#1e293b"}}>{v}</td></tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <button onClick={()=>{setMoveModal({dateStr:editRes.dateStr,slot:editRes.slot,res:editRes.res});setEditRes(null);}}
+                style={{...S.btnBlue,background:"linear-gradient(135deg,#0f766e,#0d9488)",marginTop:8}}>
+                🔀 Saati Değiştir
+              </button>
+              <button onClick={()=>cancelReservation(editRes.dateStr,editRes.slot)}
+                style={{...S.btnBlue,background:"#ef4444",marginTop:8}}>
+                🗑 Rezervasyonu İptal Et
+              </button>
+              <button style={S.btnGhost} onClick={()=>setEditRes(null)}>Kapat</button>
+            </div>
+          </div>
+        )}
+
+        {/* TAŞIMA MODAL */}
+        {moveModal&&(
+          <MoveModal
+            dateStr={moveModal.dateStr}
+            currentSlot={moveModal.slot}
+            person={moveModal.res}
+            res={res}
+            cfg={cfg}
+            onMove={async(newSlot)=>{
+              try{
+                await fbMove(moveModal.dateStr,moveModal.slot,newSlot);
+                setCopyMsg(`${moveModal.res.ad} ${moveModal.res.soyad} → ${newSlot} olarak taşındı.`);
+                setTimeout(()=>setCopyMsg(""),3000);
+              }catch(e){
+                alert(e.message==="DOLU"?"Bu saat dolu, başka bir saat seçin.":"Bir hata oluştu.");
+              }
+              setMoveModal(null);
+            }}
+            onClose={()=>setMoveModal(null)}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── TAŞIMA MODAL ───────────────────────────────────────────────────────────
+function MoveModal({dateStr,currentSlot,person,res,cfg,onMove,onClose}){
+  const allSlots = getSlotsForDay(dateStr,cfg);
+  const booked   = (res[dateStr]||[]).map(r=>r.slot);
+
+  return(
+    <div style={S.modal} onClick={onClose}>
+      <div style={{...S.modalBox,maxWidth:360}} onClick={e=>e.stopPropagation()}>
+        <h3 style={{fontFamily:"'Playfair Display',serif",marginBottom:8,color:"#1e293b"}}>🔀 Saati Değiştir</h3>
+        <p style={{color:"#64748b",fontSize:13,marginBottom:4,fontFamily:"'DM Sans',sans-serif"}}>{person.ad} {person.soyad}</p>
+        <p style={{color:"#94a3b8",fontSize:12,marginBottom:20,fontFamily:"'DM Sans',sans-serif"}}>
+          {displayDate(dateStr)} — Mevcut: <b style={{color:"#1e40af"}}>{currentSlot}</b>
+        </p>
+        <p style={{fontSize:12,fontWeight:700,color:"#374151",marginBottom:10,fontFamily:"'DM Sans',sans-serif"}}>Yeni saat seçin:</p>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,marginBottom:16}}>
+          {allSlots.map(slot=>{
+            const isCurrent = slot===currentSlot;
+            const isBooked  = booked.includes(slot)&&!isCurrent;
+            return(
+              <button key={slot} disabled={isCurrent||isBooked}
+                onClick={()=>onMove(slot)}
+                style={{
+                  padding:"10px 6px",borderRadius:10,fontFamily:"'DM Sans',sans-serif",
+                  border:isCurrent?"2px solid #3b82f6":"2px solid #e2e8f0",
+                  background:isCurrent?"#eff6ff":isBooked?"#f8fafc":"#fff",
+                  color:isCurrent?"#1e40af":isBooked?"#cbd5e1":"#1e293b",
+                  fontWeight:700,fontSize:13,cursor:isCurrent||isBooked?"not-allowed":"pointer",
+                  opacity:isBooked?0.4:1,
+                }}>
+                {slot}
+                {isCurrent&&<div style={{fontSize:9,color:"#3b82f6"}}>mevcut</div>}
+                {isBooked&&<div style={{fontSize:9,color:"#ef4444"}}>dolu</div>}
+              </button>
+            );
+          })}
+        </div>
+        <button style={S.btnGhost} onClick={onClose}>İptal</button>
+      </div>
+    </div>
+  );
+}
+
+// ── NOT MODAL ──────────────────────────────────────────────────────────────
+function NoteModal({dateStr,initialNote,onSave,onClose}){
+  const [note,setNote]=useState(initialNote||"");
+  return(
+    <div style={S.modal} onClick={onClose}>
+      <div style={{...S.modalBox,maxWidth:360}} onClick={e=>e.stopPropagation()}>
+        <h3 style={{fontFamily:"'Playfair Display',serif",marginBottom:8,color:"#1e293b"}}>📌 Gün Notu</h3>
+        <p style={{color:"#64748b",fontSize:13,marginBottom:16,fontFamily:"'DM Sans',sans-serif"}}>{displayDate(dateStr)}</p>
+        <textarea value={note} onChange={e=>setNote(e.target.value.slice(0,200))}
+          placeholder="Örn: Sınav salonu 3. katta, yanınızda kimlik getirin…"
+          rows={4} style={{...S.input,resize:"vertical",marginBottom:4,fontFamily:"'DM Sans',sans-serif"}}/>
+        <p style={{fontSize:11,color:"#94a3b8",marginBottom:12,fontFamily:"'DM Sans',sans-serif",textAlign:"right"}}>{note.length}/200</p>
+        <button style={S.btnBlue} onClick={()=>onSave(note)}>Kaydet</button>
+        {note&&<button style={{...S.btnGhost,marginTop:6,color:"#ef4444",borderColor:"#fee2e2"}} onClick={()=>onSave("")}>Notu Sil</button>}
+        <button style={S.btnGhost} onClick={onClose}>İptal</button>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
